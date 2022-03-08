@@ -56,27 +56,28 @@ innoDB使用B+树索引模型，采用N叉树，减少树高，加快查询，�
 索引下推（index condition pushdown）：在索引遍历过程中，对索引中包含的字段先做判断，直接过滤掉不满足条件的记录，减少回表次数
 
 #### 锁
-全局锁：命令Flush tables with read lock (FTWRL)，典型应用场景是做全库逻辑备份，备份过程数据库处于只读状态
+**全局锁**：命令Flush tables with read lock (FTWRL)，典型应用场景是做全库逻辑备份，备份过程数据库处于只读状态
 
 备份全库的其它实现方式
 1. 在可重复度隔离级别下开启事务，但是需要引擎支持
 2. set global readonly=true。readonly 的值会被用来做其他逻辑，比如用来判断一个库是主库还是备库。异常处理机制不同，执行 FTWRL 命令之后由于客户端发生异常断开，那么 MySQL 会自动释放这个全局锁，而设置为 readonly 之后，如果客户端发生异常，则数据库就会一直保持 readonly 状态
 
-表锁：语法lock tables … read/write。与 FTWRL 类似，可以用 unlock tables 主动释放锁，也可以在客户端断开的时候自动释放。InnoDB支持行锁的引擎一般不使用
+**表锁**：语法lock tables … read/write。与 FTWRL 类似，可以用 unlock tables 主动释放锁，也可以在客户端断开的时候自动释放。InnoDB支持行锁的引擎一般不使用
 
-元数据锁（meta data lock，MDL）：在访问表的时候会被自动加上，提交事务的时候释放。对表做增删改查加读锁，表结构变更加表锁
+**元数据锁**（meta data lock，MDL）：在访问表的时候会被自动加上，提交事务的时候释放。对表做增删改查加读锁，表结构变更加表锁
     
-行锁：需要的时候才加上，事务结束才释放
+**行锁**：需要的时候才加上，事务结束才释放
 
-死锁检测
+**死锁检测**  
 等待超时，通过参数 innodb_lock_wait_timeout 来设置。使用较少，设置太长造成业务不可用，太短可能误伤
 主动检测，发现死锁后，主动回滚死锁链条中的某一个事务。将参数 innodb_deadlock_detect 设置为 on表示开启。如果多个客户端同时更新同一行，死锁检测会消耗很多CPU
 
-事务的启动时机：
+**事务的启动时机**  
 * 使用begin/start transaction 命令，在执行到它们之后的第一个操作 InnoDB 表的语句时事务才真正启动，一致性视图是在执行第一个快照读语句时创建的
 * 使用 start transaction with consistent snapshot 命令，立马启动事务并创建一致性视图
 
-MVCC原理
+#### MVCC原理
+
 事务启动时分配transaction id，按申请顺序严格递增
 事务更新行时，将transaction id赋值给数据版本的事务ID，记为row trx_id，每个版本的数据都有自己的row trx_id
 在可重复读级别下，事务读取一行数据时，根据回滚日志遍历所有版本，找到可见的版本，如果数据为本事务更新，也是可见的
@@ -90,14 +91,17 @@ MVCC原理
 版本大于等于高水位：不可见
 介于两者之间：版本在视图数组中不可见，否则可见
 
+#### 当前读
 更新数据都是先读后写的，而这个读，只能读当前的值，称为“当前读”（current read），select 语句如果加锁，也是当前读
 
 表结构不支持可重复读，因为表结构没有对应的行数据，也没有row rtx_id，只能使用当前读
 
-change buffer：更新数据时，如果内存中没有数据页，会将更新操作记录到change buffer。后续有数据页的访问时，将数据页从磁盘读入内存，并将change buffer应用到数据页，这个过程叫merge。系统定期也会在后台触发数据页的merge。change buffer也会记录磁盘，防止丢失
+#### change buffer
+更新数据时，如果内存中没有数据页，会将更新操作记录到change buffer。后续有数据页的访问时，将数据页从磁盘读入内存，并将change buffer应用到数据页，这个过程叫merge。系统定期也会在后台触发数据页的merge。change buffer也会记录磁盘，防止丢失
 
 唯一索引的更新无法使用change buffer，因为需要判断数据的唯一性，必须读取数据页才能判断
 
+#### 索引选择
 优化器在索引选择时，会根据扫描行数和回表次数综合选择。索引上不同值的个数，称为"基数"（cardinality），这个值越大，区分度越大，越容易被优化器选择
 
 基数通过采样得到，InnoDB 默认会选择 N 个数据页，统计这些页面上的不同值，得到一个平均值，然后乘以这个索引的页面数，就得到了这个索引的基数。当变更的数据行数超过 1/M 的时候，会自动触发重新做一次索引统计
@@ -109,11 +113,13 @@ change buffer：更新数据时，如果内存中没有数据页，会将更新�
 
 analyze table t可以重新统计索引信息，force index可以强制选择索引。优化器根据索引统计信息，有时候可能选择错误的索引，比如删除数据再插入数据，如果这个过程中有其它未提交的事务，数据不会被真正删除，统计扫描行数的时候可能会加倍
 
+#### 索引优化
 给字符串添加索引，可以使用前缀索引，节省索引空间，但是要考虑索引区分度，前缀索引无法使用索引覆盖的优化，必须进行回表
 常见的字符串索引优化方式：
 1. 前缀区分度不过，可以使用倒序存储
 2. 添加一个hash字段单独做索引等方式
 
+#### 数据页
 内存数据页和磁盘数据页不一致，称作脏页。脏页刷磁盘场景：
 1. redo log写满，checkpoint往前推，对应的所有脏页写磁盘
 2. 内存不够用，将内存脏页写磁盘
@@ -139,13 +145,13 @@ delete数据只会让记录或数据页被复用，无法清理磁盘空间。�
 
 这个过程允许对原表做增删改查操作，称作Online DDL。Online DDL 其实是会先获取MDL写锁, 再退化成MDL读锁；但MDL写锁持有时间比较短，所以可以称为Online； 而MDL读锁，不阻止数据增删查改，但会阻止其它线程修改表结构
 
-Online 和 inplace：
+#### Online 和 inplace
 Online DDL 过程都在 InnoDB 内部完成，对于 server 层来说，没有把数据挪动到临时表，是一个“原地”操作，这就是“inplace”名称的来源
 DDL 过程如果是 Online 的，就一定是 inplace 的；反过来未必，也就是说 inplace 的 DDL，有可能不是 Online 的。截止到 MySQL 8.0，添加全文索引（FULLTEXT index）和空间索引 (SPATIAL index) 就属于这种情况。
 
 重建表的语句`alter table t engine=InnoDB`其实隐含语句是`alter table t engine=innodb,ALGORITHM=inplace;`跟 inplace 对应的就是拷贝表的方式了，用法是`alter table t engine=innodb,ALGORITHM=copy;`
 
-`count(*)`实现
+#### count(*)实现
 MyISAM将表的行数单独存储，获取很快，但不支持事务
 InnoDB需要扫描全部数据得到行数，但会做一些优化，比如选择空间最小的索引进行遍历。之所以要遍历，是为了实现MVCC，同一时刻不同事务所见的行数是不一样的
 
@@ -158,6 +164,7 @@ InnoDB需要扫描全部数据得到行数，但会做一些优化，比如选�
 `count(1)`: 遍历整张表，不取值，server对于返回的每一行放一个数字"1"进去，统计行数
 `count(*)`: 专门做了优化，遍历整张表，不取值，统计行数
 
+#### 崩溃恢复
 binlog写完但redo log还没commit，崩溃恢复处理
 1. 如果redo log里的事务是完整的，也就是已经有了commit标识，则直接提交
 2. 如果redo log的事务只有完整的prepare，则判断对应的事务binlog是否存在并完整，如果是，则提交事务，如果否，则回滚事务
@@ -166,7 +173,8 @@ binlog写完但redo log还没commit，崩溃恢复处理
 * statement格式的binlog，最后会有COMMIT
 * row格式的binlog，最后会有一个XID event。redo log和binlog通过XID关联
 
-order by工作流程`select A,B,C from t where A='xx' order by B limit 1000`
+#### order by
+`select A,B,C from t where A='xx' order by B limit 1000`工作流程
 
 1. 如果存在覆盖索引(A,B,C)，无需排序，直接从索引里取满足条件的1000行
 2. 如果存在联合索引(A,B)，无需排序，从索引里取满足条件的1000个主键ID，再回表拿到对应结果
@@ -189,11 +197,13 @@ order by工作流程`select A,B,C from t where A='xx' order by B limit 1000`
 
 explain命令的Extra 字段显示 Using filesort表示需要执行排序操作，Using temporary表示需要使用临时表，如`order by rand()`就会用到临时表，如果临时表需要的内存小于等于tmp_table_size则使用内存临时表，引擎为memory，超过该值则使用磁盘临时表，默认引擎是InnoDB
 
+#### 索引失效
 对查询字段做函数操作或隐式转换会导致无法使用索引查找，有如下几种情况
 * 对索引字段做函数操作，如`select count(*) from tradelog where month(t_modified)=7`或`where id + 1 = 1000`
 * 字符串和数字做比较，会将字符串转换成数字，如`select * from tradelog where tradeid=110717`，tradeid会被转换成数字再作比较
 * 不同字符集的比较，如utf8字符和utf8mb4字符比较，会将utf8转换成utf8mb4，如果查询字段为utf8，则无法使用索引查找，如`select d.* from tradelog l, trade_detail d where d.tradeid=l.tradeid and l.id=2`，其中d.tradeid为utf8，l.tradeid为utf8mb4
 
+#### 慢查询
 查询一行语句也很慢的场景，如`select * from t where id=1`
 1. 等MDL锁，如有其它session执行了`lock table t write`，可以用`select blocking_id from sys.schema_table_lock_waits`查找造成阻塞的pid，然后用`kill <pid>`断开连接
 2. 等flush，session A执行`select sleep(1) from t`，session B执行`flush table t`，session C执行 `select * from t where id=1`就会被阻塞
@@ -212,7 +222,8 @@ explain命令的Extra 字段显示 Using filesort表示需要执行排序操作�
 4. undo log太长，如以下执行顺序，session A启动一致性读，session B更新完后生成了100万个回滚日志，此时session A再执行`select * from t where id=1`就会执行100万次回滚操作才能拿到最初的结果，而`select * from t where id=1 lock in share mode`是当前读，加锁反而读的更快
 
     ![0bb632667a1892934d2af95a6c782db6](MySQL实战学习笔记.resources/DA730E60-91C6-447B-91C6-A1CA3FB3272B.png)
-    
+   
+#### 间隙锁
 间隙锁只在可重复度隔离级别下生效，在读提交隔离级别下，为了解决可能出现数据和日志不一致问题，需要把binlog格式设置为row
 
 间隙锁和间隙锁之间不冲突，只会影响insert操作
@@ -294,7 +305,7 @@ insert into t values(0,0,0),(5,5,5),
     
 读提交隔离级别下，语句执行过程中加上的行锁，在语句执行完成后，就要把“不满足条件的行”上的行锁直接释放了，不需要等到事务提交
    
-一些极端场景的处理
+#### 极端场景处理
 1. 短链接风暴
     
     * 杀掉空闲连接。show processlist查看连接状态，从information_schema.innodb_trx 查询事务状态，trx_row_modified为0代表该事务没有修改过数据，可以杀掉
@@ -305,7 +316,9 @@ insert into t values(0,0,0),(5,5,5),
     * 如果是单独的数据库，可以删掉用户，让新连接连不成功
     * 使用查询重写功能，把压力最大的 SQL 语句直接重写成"select 1"返回
 
-binlog写入机制
+#### 日志写入
+**binlog写入机制**
+
 每个线程在内存分配binlog cache，大小由binlog_cache_size参数控制，事务执行过程中先写binlog cache，事务提交的时候，将binlog cache写到binlog文件中
 
 写文件有write和fsync接口，write是写文件系统的页缓存，fsync才真正刷磁盘。调用时机由参数sync_binlog控制
@@ -313,7 +326,8 @@ binlog写入机制
 2. sync_binlog=1 的时候，表示每次提交事务都会执行 fsync
 3. sync_binlog=N(N>1) 的时候，表示每次提交事务都 write，但累积 N 个事务后才 fsync
 
-redo log写入机制
+**redo log写入机制**
+
 先写redo log buffer，再write写文件，fsync刷磁盘，写入策略由innodb_flush_log_at_trx_commit参数控制
 1. 设置为 0 的时候，表示每次事务提交时都只是把 redo log 留在 redo log buffer 中
 2. 设置为 1 的时候，表示每次事务提交时都将 redo log 直接持久化到磁盘
@@ -330,7 +344,7 @@ InnoDB后台线程每隔1秒会把redo log buffer中的日志，调用write写�
 
 双 1”配置，指的就是 sync_binlog 和 innodb_flush_log_at_trx_commit 都设置成 1。也就是说，一个事务完整提交前，需要等待两次刷盘，一次是 redo log（prepare 阶段），一次是 binlog
 
-组提交机制
+**组提交机制**
 
 LSN（log sequence number，日志逻辑序列号）是单调递增的，用来对应 redo log 的一个个写入点。每次写入长度为 length 的 redo log， LSN 的值就会加上 length
 
@@ -366,6 +380,7 @@ MySQL 为了让组提交的效果更好，调整了fsync的执行时机，如下
 update语句在节点A执行，同步到节点B的流程
 ![27b69625c186d1191054cd8c0550cd2b](MySQL实战学习笔记.resources/2EBB509B-4F06-410D-938E-88F467D6EA43.png)
 
+#### 日志同步
 一个事务日志同步到完整过程
 1. 在备库B上通过change master命令，设置主库A的IP、端口、用户、密码以及要从哪个位置开始请求binlog，这个位置包含文件名和日志偏移量
 2. 在备库B上执行start slave命令，这时候备库会启动两个线程，就是图中的io_thread和sql_thread，其中io_thread负责与主库建立连接
@@ -462,16 +477,16 @@ MySQL可以设置双Master结构，即A和B互为主备，这种情况下需要�
 
 从库和主库的同步延时，包括binlog同步的网络延时，和从库执行事务的耗时，`show slave status`命令返回结果里的seconds_behind_master字段表示备库延时了多少秒。从库在连上主库时会执行`SELECT UNIX_TIMESTAMP()`来获取当前主库时间，算出和自己本地时间点差值，在计算seconds_behind_master时会扣掉这个差值
 
-导致主备延迟的原因
+#### 导致主备延迟的原因
 1. 从库机器比主库性能差
 2. 从库压力大，比如进行大量查询操作
 3. 大事务，如一次性delete太多数据，或大表的DDL操作
 
-主备切换不同策略
+#### 主备切换不同策略
 可靠性优先：等待备库的seconds_behind_master值低于某个阈值，将主库改为只读，再等待备库的seconds_behind_master变为0，将备库改为读写。等待seconds_behind_master变为0的期间，系统处于不可写状态
 可用性优先：不等数据同步，直接将备库改为可读写，可能出现数据不一致的问题。如在主库A执行Q1，同步到备库B还没来得及执行，发生主备切换，在备库执行Q2，Q2又会同步到A执行，这样A的执行顺序是Q1，Q2，B的执行顺序是Q2，Q1
 
-基于点位的主备切换
+#### 基于点位的主备切换
 假设有主库A，备库A'，从库B，A和A'互为主备，B先从A同步数据，当A发生故障，A'成为主库，此时B要切换为从A'同步数据，由于A和A'上的数据并不实时同步，因此B从A'同步数据时需要指定同步点位才能保证数据不丢失
 
 同步时执行change master命令
@@ -514,7 +529,7 @@ start slave;
 
 因此，我们可以把 slave_skip_errors 设置为 “1032,1062”，这样中间碰到这两个错误时就直接跳过。前提是知道跳过这两个错误是无损的，同步完后还要恢复设置为空
 
-GTID
+#### GTID
 事务提交的时候会生成全局GTID（Global Transaction Identifier），格式如下
 ```
 GTID=server_uuid:gno
@@ -566,7 +581,7 @@ start slave;
 
 这样执行start slave的时候，虽然实例X还是会执行Y同步过来的事务，但是会跳过GTID为aaaaaaaa-cccc-dddd-eeee-ffffffffffff:10的事务，就不会出现主键冲突错误了
 
-基于GTID的主备切换
+#### 基于GTID的主备切换
 语法如下
 ```
 CHANGE MASTER TO 
