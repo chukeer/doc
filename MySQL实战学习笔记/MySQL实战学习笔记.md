@@ -468,3 +468,115 @@ MySQL可以设置双Master结构，即A和B互为主备，这种情况下需要�
 主备切换不同策略
 可靠性优先：等待备库的seconds_behind_master值低于某个阈值，将主库改为只读，再等待备库的seconds_behind_master变为0，将备库改为读写。等待seconds_behind_master变为0的期间，系统处于不可写状态
 可用性优先：不等数据同步，直接将备库改为可读写，可能出现数据不一致的问题。如在主库A执行Q1，同步到备库B还没来得及执行，发生主备切换，在备库执行Q2，Q2又会同步到A执行，这样A的执行顺序是Q1，Q2，B的执行顺序是Q2，Q1
+
+基于点位的主备切换
+假设有主库A，备库A'，从库B，A和A'互为主备，B先从A同步数据，当A发生故障，A'成为主库，此时B要切换为从A'同步数据，由于A和A'上的数据并不实时同步，因此B从A'同步数据时需要指定同步点位才能保证数据不丢失
+
+同步时执行change master命令
+```
+CHANGE MASTER TO 
+MASTER_HOST=$host_name 
+MASTER_PORT=$port 
+MASTER_USER=$user_name 
+MASTER_PASSWORD=$password 
+MASTER_LOG_FILE=$master_log_name 
+MASTER_LOG_POS=$master_log_pos  
+```
+
+最后两个参数 MASTER_LOG_FILE 和 MASTER_LOG_POS 表示，要从主库的 master_log_name 文件的 master_log_pos 这个位置的日志继续同步。而这个位置就是我们所说的同步位点，也就是主库对应的文件名和日志偏移量
+
+寻找同步点位的粗略做法
+1. 等待新主库 A’把中转日志（relay log）全部同步完成
+2. 在 A’上执行 show master status 命令，得到当前 A’上最新的 File 和 Position
+3. 取原主库 A 故障的时刻 T
+4. 用 mysqlbinlog 工具解析 A’的 File，得到 T 时刻的位点。
+    ```
+    mysqlbinlog File --stop-datetime=T --start-datetime=T
+    ```
+    ![9620f07a832bb8a10d42bd8615faf8bb](MySQL实战学习笔记.resources/DEAA20C2-6654-47FA-A78C-FC5F25055E05.png)
+    
+    图中，end_log_pos 后面的值“123”，表示的就是 A’这个实例，在 T 时刻写入新的 binlog 的位置
+    
+这样得到的位点并不准确，可能T时刻之后的数据已经同步到了从库，从库如果再从T时刻对应的位点去向A'同步，就会得到重复度数据，可能报错导致停止同步。可以采取主动跳过错误的方式
+
+主动跳过一个事务
+```
+set global sql_slave_skip_counter=1;
+start slave;
+```
+
+设置 slave_skip_errors 参数，直接设置跳过指定的错误
+在执行主备切换时，有这么两类错误，是经常会遇到的：
+* 1062 错误是插入数据时唯一键冲突
+* 1032 错误是删除数据时找不到行
+
+因此，我们可以把 slave_skip_errors 设置为 “1032,1062”，这样中间碰到这两个错误时就直接跳过。前提是知道跳过这两个错误是无损的，同步完后还要恢复设置为空
+
+GTID
+事务提交的时候会生成全局GTID（Global Transaction Identifier），格式如下
+```
+GTID=server_uuid:gno
+```
+* server_uuid是一个实例第一次启动时自动生成的，是一个全局唯一的值
+* gno是一个整数，初始值是1，每次提交事务的时候分配给这个事务，并加1。注意和事务id区分，事务id是在事务执行过程中分配的，即便事务回滚了，事务id也会递增，而这里的gno是在事务提交的时候才会分配
+
+启动GTID：加上参数 gtid_mode=on 和 enforce_gtid_consistency=on
+
+在GTID模式下，每个事务会跟一个GTID一一对应，生成GTID有两种方式，取决于session的gtid_next值
+
+1. gtid_next=automatic，表示使用默认值，此时MySQL会把当前server_uuid:gno分配给这个事务，记录binlog时会先记录一行`SET @@SESSION.GTID_NEXT=‘server_uuid:gno`，并把这个GTID加入本实例的GTID集合
+2. gtid_next指定为特定值，比如通过set gtid_next='current_gtid’指定为 current_gtid，那么就有两种可能
+    a. 如果 current_gtid 已经存在于实例的 GTID 集合中，接下来执行的这个事务会直接被系统忽略
+    b. 如果 current_gtid 没有存在于实例的 GTID 集合中，就将这个 current_gtid 分配给接下来要执行的事务，也就是说系统不需要给这个事务生成新的 GTID，因此 gno 也不用加 1
+    
+注意，一个 current_gtid 只能给一个事务使用。这个事务提交后，如果要执行下一个事务，就要执行 set 命令，把 gtid_next 设置成另外一个 gtid 或者 automatic。这样，每个 MySQL 实例都维护了一个 GTID 集合，用来对应“这个实例执行过的所有事务”
+
+GTID举例
+假设在实例X创建如下表
+```
+CREATE TABLE `t` (
+  `id` int(11) NOT NULL,
+  `c` int(11) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB;
+
+insert into t values(1,1);
+```
+
+则binlog中信息如下，记录了两条GTID信息
+![8c87fbd2f84404a59fee2c0ab0333bee](MySQL实战学习笔记.resources/1FF049E5-43C9-434D-9BC9-6750900CD5A7.png)
+
+假设，现在这个实例 X 是另外一个实例 Y 的从库，并且此时在实例 Y 上执行了下面这条插入语句
+```
+insert into t values(1,1);
+```
+这条语句在实例 Y 上的 GTID 是 “aaaaaaaa-cccc-dddd-eeee-ffffffffffff:10”。如果直接同步会出现主键冲突报错，导致同步失败，可按如下方式处理
+
+```
+set gtid_next='aaaaaaaa-cccc-dddd-eeee-ffffffffffff:10';
+begin;
+commit;
+set gtid_next=automatic;
+start slave;
+```
+前三条语句的作用，是通过提交一个空事务，把这个 GTID 加到实例 X 的 GTID 集合中，如下
+![e1faf37319256d6cca97c9e360f905f4](MySQL实战学习笔记.resources/8347D1C2-43AF-4DAD-A676-B5BE4FF0451E.png)
+
+这样执行start slave的时候，虽然实例X还是会执行Y同步过来的事务，但是会跳过GTID为aaaaaaaa-cccc-dddd-eeee-ffffffffffff:10的事务，就不会出现主键冲突错误了
+
+基于GTID的主备切换
+语法如下
+```
+CHANGE MASTER TO 
+MASTER_HOST=$host_name 
+MASTER_PORT=$port 
+MASTER_USER=$user_name 
+MASTER_PASSWORD=$password 
+master_auto_position=1 
+```
+master_auto_position=1 就表示这个主备关系使用的是 GTID 协议。在实例B上执行start slave命令，取binlog逻辑如下
+1. 实例B指定新的主库A'，基于主备协议建立连接
+2. 实例B把自己的GTID集合set_b发送给A'
+3. 实例A'算出自己GTID集合set_a和B传过来的set_b的差集，即存在于set_a但不存在与set_b中的GTID集合，判断是否包含这个差集需要的所有binlog事务
+    a. 如果不包含，表示A'已经把B需要的binlog给删掉了，直接返回错误
+    b. 如果确认全部包含，A'从自己的binlog文件里，找出差集中第一个事务，发送给B，之后就从这个事务开始，往后读文件，按顺序取binlog发送给B
