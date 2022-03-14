@@ -486,14 +486,14 @@ MySQL可以设置双Master结构，即A和B互为主备，这种情况下需要�
 可靠性优先：等待备库的seconds_behind_master值低于某个阈值，将主库改为只读，再等待备库的seconds_behind_master变为0，将备库改为读写。等待seconds_behind_master变为0的期间，系统处于不可写状态
 可用性优先：不等数据同步，直接将备库改为可读写，可能出现数据不一致的问题。如在主库A执行Q1，同步到备库B还没来得及执行，发生主备切换，在备库执行Q2，Q2又会同步到A执行，这样A的执行顺序是Q1，Q2，B的执行顺序是Q2，Q1
 
-#### 并行复制
+### 并行复制
 基本原理：可以并行执行的事务，分配给不同的worker执行，增加执行并发度
 
-**MariaDB 的并行复制策略**
+#### MariaDB 的并行复制策略
 
 redo log组提交里的事务，一定不会修改同一行，因此可以并发执行。在一组里面一起提交的事务，有一个相同的 commit_id，下一组就是 commit_id+1；commit_id 直接写到 binlog 里面；传到备库应用的时候，相同 commit_id 的事务分发到多个 worker 执行
 
-**5.7.22版本实现**
+#### 5.7.22版本实现
 
 通过参数binlog-transaction-dependency-tracking控制
 
