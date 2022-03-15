@@ -159,10 +159,10 @@ InnoDB需要扫描全部数据得到行数，但会做一些优化，比如选�
 
 不同count的效率比较：`count(字段)<count(主键 id)<count(1)≈count(*)`
 
-`count(字段)`: 取字段值，判断非空，统计行数
-`count(主键 id)`: 取主键id，统计行数
-`count(1)`: 遍历整张表，不取值，server对于返回的每一行放一个数字"1"进去，统计行数
-`count(*)`: 专门做了优化，遍历整张表，不取值，统计行数
+* `count(字段)`: 取字段值，判断非空，统计行数
+* `count(主键 id)`: 取主键id，统计行数
+* `count(1)`: 遍历整张表，不取值，server对于返回的每一行放一个数字"1"进去，统计行数
+* `count(*)`: 专门做了优化，遍历整张表，不取值，统计行数
 
 #### 崩溃恢复
 binlog写完但redo log还没commit，崩溃恢复处理
@@ -614,3 +614,41 @@ master_auto_position=1 就表示这个主备关系使用的是 GTID 协议。在
 3. 实例A'算出自己GTID集合set_a和B传过来的set_b的差集，即存在于set_a但不存在与set_b中的GTID集合，判断是否包含这个差集需要的所有binlog事务
     a. 如果不包含，表示A'已经把B需要的binlog给删掉了，直接返回错误
     b. 如果确认全部包含，A'从自己的binlog文件里，找出差集中第一个事务，发送给B，之后就从这个事务开始，往后读文件，按顺序取binlog发送给B
+
+#### 过期读处理方式
+在读写分离场景下，往主库写入数据，在从库读数据，由于存在同步延时，可能会读不到数据，这种称为『过期读』，解决过期读有一下思路
+
+1. 强制走主库
+2. sleep方案，写完主库之后sleep一段时间在读从库
+3. 判断主备无延迟，这种方式只能判断同步到备库的日志执行完成，可能还有没有同步过来的数据
+    1. 判show slave status里的seconds_behind_master是否为0，单位为秒，精度不是很高
+    2. 对比点位，Master_Log_File 和 Read_Master_Log_Pos，表示的是读到的主库的最新位点，Relay_Master_Log_File 和 Exec_Master_Log_Pos，表示的是备库执行的最新位点，如果两组值一致则表示日志同步完成
+    3. 对比GTID集合，Retrieved_Gtid_Set，是备库收到的所有日志的 GTID 集合，Executed_Gtid_Set，是备库所有已经执行完成的 GTID 集合，如果两个集合相同，表示备库收到的日志都已经同步完成
+4. semi-sync replication，主库把binlog发送给从库，需要等ack，收到ack后才能给客户端返回『事务完成』的确认。存在以下问题：
+    1. 如果有多个从库，只会等一个ack，从其它从库读取仍旧过期；
+    2. 写入量大多时候，延迟可能一直产生
+5. 等主库点位，在主库执行的事务，只需要等改事务同步到从库，即可从从库读取，而无需等待主备完全同步。可在从库执行以下语句
+    ```
+    select master_pos_wait(file, pos[, timeout]);
+    ```
+    参数 file 和 pos 指的是主库上的文件名和位置；timeout 可选，设置为正整数 N 表示这个函数最多等待 N 秒。这个命令正常返回的结果是一个正整数 M，表示从命令开始执行，到应用完 file 和 pos 表示的 binlog 位置，执行了多少事务，其它返回结果含义
+    1. 如果执行期间，备库同步线程发生异常，则返回 NULL；
+    2. 如果等待超过 N 秒，就返回 -1；
+    3. 如果刚开始执行的时候，就发现已经执行过这个位置了，则返回 0
+    
+    在主库写入一个事务后，要保证在从库查到正确数据，可以使用以下逻辑
+    1. 事务更新完成后，马上执行show master status 得到当前主库执行到的 File 和 Position
+    2. 选定一个从库执行查询语句
+    3. 在从库上执行select master_pos_wait(File, Position, 1)
+    4. 如果返回值>=0，则在这个从库执行查询语句
+    5. 否则到主库执行查询语句
+6. 等待GTID，思路和等主库点位类似，语句为
+    ```
+    select wait_for_executed_gtid_set(gtid_set, 1)
+    ```
+    这条语句的逻辑是：
+    1. 等待，直到这个库执行的事务中包含传入的 gtid_set，返回 0
+    2. 超时返回1
+    
+    执行事务后获取GTID分方法：
+    将参数 session_track_gtids 设置为 OWN_GTID，然后通过 API 接口 mysql_session_track_get_first 从返回包解析出 GTID 的值即可
