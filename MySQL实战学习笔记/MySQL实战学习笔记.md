@@ -652,3 +652,46 @@ master_auto_position=1 就表示这个主备关系使用的是 GTID 协议。在
     
     执行事务后获取GTID分方法：
     将参数 session_track_gtids 设置为 OWN_GTID，然后通过 API 接口 mysql_session_track_get_first 从返回包解析出 GTID 的值即可
+    
+#### 判断数据库是否正常
+1. select 1
+    只能判断进程是否还在，不能说明库没有问题
+    
+    设置innodb_thread_concurrency可以控制InnoDB并发查询线程上线，对于正在等锁的线程是不会算在并发数里的，只有在执行查询的线程才算
+    
+    如果并发数达到上限，`select 1`返回正常，但是`select * from t`就会阻塞
+    
+2. 执行更新操作
+    创建一个专门做健康检查都表，执行更新语句
+    ```
+    update mysql.health_check set t_modified=now();
+    ```
+    对于双Master的结构，可以加上server_id做主键，避免在两个master执行更新冲突
+    ```
+    insert into mysql.health_check(id, t_modified) values (@@server_id, now()) on duplicate key update t_modified=now();
+    ```
+3. 检测每个操作的耗时
+    MySQL 5.6版本以后提供了performance_schema.file_summary_by_event_name表里统计了每次IO请求时间，格式如下
+    ![a2a3a0839c7b55e10636650b08e81c54](MySQL实战学习笔记.resources/010AE3D9-1D35-4D6A-B30F-0C374495DBA4.png)
+    图中统计的是redo log的写入时间
+    第一列EVENT_NAME表示统计类型
+    第一组五列，是所有IO类型的统计，COUNT_STAR是所有IO的总次数，接下来四列是具体统计项，单位上皮秒
+    第二组六列，是读操作的统计，最后一列SUM_NUMBER_OF_BYTES_READ统计的是总统从redo log里读了多少字节
+    第三组六列，是写操作的统计
+    第四组数据，是对其它类型统计，在redo log里，可以认为是对fsync的统计
+    
+    在performance_schema.file_summary_by_event_name表中，binlog对应的是event_name = "wait/io/file/sql/binlog"这一行，各个字段统计逻辑和redo log类似
+    
+    开启所有performance_schema项，性能会下降10%左右。开启redo log时间监控，执行如下语句
+    ```
+    mysql> update setup_instruments set ENABLED='YES', Timed='YES' where name like '%wait/io/file/innodb/innodb_log_file%';
+    ```
+    
+    可以通过 MAX_TIMER 的值来判断数据库是否出问题了，比如设定阈值，单次IO请求时间超过200ms属于异常，用类似下面语句作为检测逻辑
+    ```
+    mysql> select event_name,MAX_TIMER_WAIT  FROM performance_schema.file_summary_by_event_name where event_name in ('wait/io/file/innodb/innodb_log_file','wait/io/file/sql/binlog') and MAX_TIMER_WAIT>200*1000000000;
+    ```
+    发现异常后，取到需要的信息，再通过以下语句把之前的统计信息清空
+    ```
+    mysql> truncate table performance_schema.file_summary_by_event_name;
+    ```
