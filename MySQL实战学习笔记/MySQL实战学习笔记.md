@@ -673,11 +673,11 @@ master_auto_position=1 就表示这个主备关系使用的是 GTID 协议。在
 3. 检测每个操作的耗时
     MySQL 5.6版本以后提供了performance_schema.file_summary_by_event_name表里统计了每次IO请求时间，格式如下
     ![a2a3a0839c7b55e10636650b08e81c54](MySQL实战学习笔记.resources/010AE3D9-1D35-4D6A-B30F-0C374495DBA4.png)
-    图中统计的是redo log的写入时间
-    第一列EVENT_NAME表示统计类型
-    第一组五列，是所有IO类型的统计，COUNT_STAR是所有IO的总次数，接下来四列是具体统计项，单位上皮秒
-    第二组六列，是读操作的统计，最后一列SUM_NUMBER_OF_BYTES_READ统计的是总统从redo log里读了多少字节
-    第三组六列，是写操作的统计
+    图中统计的是redo log的写入时间  
+    第一列EVENT_NAME表示统计类型  
+    第一组五列，是所有IO类型的统计，COUNT_STAR是所有IO的总次数，接下来四列是具体统计项，单位上皮秒  
+    第二组六列，是读操作的统计，最后一列SUM_NUMBER_OF_BYTES_READ统计的是总统从redo log里读了多少字节  
+    第三组六列，是写操作的统计  
     第四组数据，是对其它类型统计，在redo log里，可以认为是对fsync的统计
     
     在performance_schema.file_summary_by_event_name表中，binlog对应的是event_name = "wait/io/file/sql/binlog"这一行，各个字段统计逻辑和redo log类似
