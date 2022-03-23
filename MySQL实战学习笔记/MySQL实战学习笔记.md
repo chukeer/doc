@@ -769,3 +769,48 @@ select id from t where c in(5,20,10) order by c desc for update;
 间隙锁是由『这个间隙右边的那个记录』定义的，如间隙锁(10, 15)，当记录10被删除后，间隙锁会扩大为(5,15)
 
 空表也有间隙，范围为(-∞, supremum]
+
+#### 误删数据的回复
+**误删行**
+
+可以使用Flashback工具恢复数据，前提是binlog_format=row和binlog_row_image=FULL
+
+恢复方式：  
+1. 对于insert语句，对应的 binlog event 类型是 Write_rows event，把它改成 Delete_rows event 即可；
+2. 对于delete语句，也是将 Delete_rows event 改为 Write_rows event；
+3. 对于update语句，binlog 里面记录了数据行修改前和修改后的值，对调这两行的位置即可。
+
+如果误操作有多个，则按操作相反的顺序来恢复
+
+预防误删可以设置sql_safe_updates参数为on，这样如果忘记在 delete 或者 update 语句中写 where 条件，或者 where 条件里面没有包含索引字段的话，这条语句的执行就会报错
+
+**误删库/表**
+
+使用全量备份加增量日志的方式恢复
+
+比如中午12点误删一个库，最近的备份是当天0点，则恢复流程为
+
+1. 用0点的备份恢复出一个临时库
+2. 从日志备份里，去除凌晨0点之后的日志
+3. 把这些日志，除了误删除数据的语句外，全部应用到临时库
+
+为了加快恢复，可以在使用mysqlbinlog命令的时候，加上--datebase参数，用来指定误删表所在的库，避免恢复数据时还要应用其它库的日志
+
+在应用日志要跳过误操作的那个语句的binlog，有两种方式
+
+1. 如果没有使用GTID模式，先用--stop-position参数执行到误操作之前的日志，然后再用--start-position从误操作之后的日志继续执行
+2. 如果使用了GTID模式，假设误操作命令的GITD为gtid1，则只需要执行set gtid_next=gtid1;begin;commit;先把这个GTID加到临时实例的GTID集合，之后按顺序执行binlog的时候，就会自动跳过误操作的语句
+
+**延迟复制备库**
+
+通过 CHANGE MASTER TO MASTER_DELAY = N 命令，可以指定这个备库持续保持跟主库有 N 秒的延迟。发现误操作后，先执行stop slave，再通过前面介绍的跳过误操作命令的方法，就可以恢复出需要的数据
+
+**预防误删除库/表的方法**
+
+1. 账号分离，只给业务开发同学DML权限，而不给truncate/drop权限
+2. 指定操作规范，如删除表之前，必须先对表做改名，观察一段时间，确保对业务无影响以后再删除这张表
+
+**rm删除数据**
+
+对于高可用机制的MySQL集群，如果只是删除一个节点的数据，HA系统就会开始工作，选出一个新的主库，这时只需要在这个节点上把数据恢复回来，再接入整个集群
+
