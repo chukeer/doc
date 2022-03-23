@@ -741,7 +741,7 @@ select id from t where c in(5,20,10) order by c desc for update;
 
 执行 show engine innodb status，有一节 LATESTDETECTED DEADLOCK，就是记录的最后一次死锁信息
 
-![168f5352b51b1c9db5321a36071c8586.png](evernotecid://EEC0C11C-72D0-424A-B3F0-C5E7487A7BDC/appyinxiangcom/937263/ENNote/p760?hash=168f5352b51b1c9db5321a36071c8586)
+![168f5352b51b1c9db5321a36071c8586](MySQL实战学习笔记.resources/AF1D5914-7DBE-4C6B-AB06-CE9BC160DCAC.png)
 
 
 1. 这个结果分成三部分：
