@@ -770,7 +770,7 @@ select id from t where c in(5,20,10) order by c desc for update;
 
 空表也有间隙，范围为(-∞, supremum]
 
-#### 误删数据的回复
+#### 误删数据的恢复
 **误删行**
 
 可以使用Flashback工具恢复数据，前提是binlog_format=row和binlog_row_image=FULL
@@ -814,3 +814,65 @@ select id from t where c in(5,20,10) order by c desc for update;
 
 对于高可用机制的MySQL集群，如果只是删除一个节点的数据，HA系统就会开始工作，选出一个新的主库，这时只需要在这个节点上把数据恢复回来，再接入整个集群
 
+#### Kill
+
+kill命令有两种
+* kill query <thread_id>
+* kill connection <thread_id>, connection可以省略
+
+执行kill query thread_id_B，MySQL里处理kill命令的线程做了两件事
+1. 把session B的运行状态改成THD::KILL_QUERY
+2. 给session B的执行线程发一个信号
+
+
+发信号是为了让session B退出等待，来处理THD::KILL_QUERY状态
+
+1. 一个语句执行过程中有多处“埋点”，在这些“埋点”的地方判断线程状态，如果发现线程状态是 THD::KILL_QUERY，才开始进入语句终止逻辑；
+2. 如果处于等待状态，必须是一个可以被唤醒的等待，否则根本不会执行到“埋点”处；
+3. 语句从开始进入终止逻辑，到终止逻辑完全完成，是有一个过程的。
+
+kill不掉的例子如下，设置set global innodb_thread_concurrency=2，执行下面的序列
+
+![2147e33dab7d5ab4db7693646f6fe484](MySQL实战学习笔记.resources/5D96097E-F6A7-4A37-99E1-74476FABE8E8.png)
+
+kill query C无法终止线程，kill C会终止连接，但是这时候，如果在 session E 中执行 show processlist，能看到下面这个图
+
+![8696453b899413e36b0bc2bf834e1995](MySQL实战学习笔记.resources/6AE73B08-9C09-4C0B-840D-4BCFDB1CAE97.png)
+
+被kill的线程Command列显示Killed，连接虽然断开了，但是语句还在执行，因为此时被kill的线程处于等待进入InnoDB的循环过程中，没有机会去判断线程的状态，因此不会进入终止逻辑阶段
+
+执行kill connection命令时
+1. 把线程状态设置为KILL_CONNECTION
+2. 关掉线程的网络连接
+
+执行show processlist的时候，如果一个线程的状态是KILL_CONNECTION，就把Command列显示成Killed
+
+kill无效的场景
+1. 线程没有执行到判断线程状态的逻辑
+2. 终止逻辑耗时较长
+    1. 超大事务执行期间被kill，回滚耗时较长
+    2. 大查询回滚，如果查询过程中生成比较大的临时文件，加上此时文件系统压力大，删除临时文件耗时较长
+    3. DDL命令执行到最后阶段被kill，需要删除中间过程的临时文件，可能受IO资源影响耗时较长
+    
+数据库表特别多，客户端连接可能很慢，如
+
+![c44f3deadb23a2343d2ca798560828a2](MySQL实战学习笔记.resources/B2AD3F3C-B706-4C18-9473-96422155F818.png)
+
+这是因为MySQL客户端会提供一个本地库名和表名的补全功能，客户端连接成功后，需要多做一些操作
+1. 执行show database
+2. 切换到db1库，执行show tables
+3. 把这两个命令的结果用于构建一个本地的哈希表
+
+当库中断表比较多时，第三步耗时较长。可以通过添加-A命令关掉补全功能
+
+
+
+MySQL 客户端发送请求后，接收服务端返回结果的方式有两种：
+1. 一种是本地缓存，也就是在本地开一片内存，先把结果存起来。如果你用 API 开发，对应的就是 mysql_store_result 方法。
+2. 另一种是不缓存，读一个处理一个。如果你用 API 开发，对应的就是 mysql_use_result 方法。
+
+客户端使用--quic选项可能会降低服务端性能，主要有以下三点效果
+
+1. 跳过表名自动补全功能
+2. 不使用本地缓存，减少客户端本地机器的性能开销
+3. 不会把执行命令记录到本地的命令历史文件
