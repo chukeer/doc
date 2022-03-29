@@ -865,8 +865,6 @@ kill无效的场景
 
 当库中断表比较多时，第三步耗时较长。可以通过添加-A命令关掉补全功能
 
-
-
 MySQL 客户端发送请求后，接收服务端返回结果的方式有两种：
 1. 一种是本地缓存，也就是在本地开一片内存，先把结果存起来。如果你用 API 开发，对应的就是 mysql_store_result 方法。
 2. 另一种是不缓存，读一个处理一个。如果你用 API 开发，对应的就是 mysql_use_result 方法。
@@ -876,3 +874,159 @@ MySQL 客户端发送请求后，接收服务端返回结果的方式有两种�
 1. 跳过表名自动补全功能
 2. 不使用本地缓存，减少客户端本地机器的性能开销
 3. 不会把执行命令记录到本地的命令历史文件
+
+#### 全表扫描
+服务端流程：
+1. 获取一行，写到 net_buffer 中。这块内存的大小是由参数 net_buffer_length 定义的，默认是 16k。
+2. 重复获取行，直到 net_buffer 写满，调用网络接口发出去。
+3. 如果发送成功，就清空 net_buffer，然后继续取下一行，并写入 net_buffer。
+4. 如果发送函数返回 EAGAIN 或 WSAEWOULDBLOCK，就表示本地网络栈（socket send buffer）写满了，进入等待。直到网络栈重新可写，再继续发送
+
+全表扫描对服务端内存开销不大
+
+show processlist看到 State 的值一直处于“Sending to client”，就表示服务器端的网络栈写满了
+
+![6c07631add70bded1893c65651232553](MySQL实战学习笔记.resources/E111DED0-1029-4A98-A3C7-6579C8182CB9.png)
+
+“Sending data”状态并不一定是指“正在发送数据”，而可能是处于执行器过程中的任意阶段
+
+查询时如果内存数据页是最新的，则直接读取内存数据，因此Buffer Pool可以提高查询速度。InnoDB Buffer Pool 的大小是由参数 innodb_buffer_pool_size 确定的，一般建议设置成可用物理内存的 60%~80%
+
+执行 show engine innodb status ，可以看到“Buffer pool hit rate”字样，显示的就是当前的命中率。一般情况下，一个稳定服务的线上系统，要保证响应时间符合要求的话，内存命中率要在 99% 以上
+
+![cdef793542433f13c898656a56c1f568](MySQL实战学习笔记.resources/41BAE562-0C09-404B-821E-04354FD15E8C.png)
+
+
+内存管理使用LRU算法，分old和young区
+
+1. 第一次被访问的数据，先进入old区
+2. 在old区存在时间超过1秒，进入young区头部，否则保持不变
+
+这样对大表进行全表扫描时，只会影响old区，可以保证Buffer Pool的内存命中率
+
+#### join
+表结构
+```
+CREATE TABLE `t2` (
+  `id` int(11) NOT NULL,
+  `a` int(11) DEFAULT NULL,
+  `b` int(11) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `a` (`a`)
+) ENGINE=InnoDB;
+
+drop procedure idata;
+delimiter ;;
+create procedure idata()
+begin
+  declare i int;
+  set i=1;
+  while(i<=1000)do
+    insert into t2 values(i, i, i);
+    set i=i+1;
+  end while;
+end;;
+delimiter ;
+call idata();
+
+create table t1 like t2;
+insert into t1 (select * from t2 where id<=100)
+```
+
+**Index Nested-Loop Join**
+
+被驱动表有索引，对驱动表t1做全表扫描，对被驱动表t2做树搜索过程
+
+```
+select * from t1 straight_join t2 on (t1.a=t2.a);
+```
+
+1. 从表t1读入一行数据R
+2. 从数据行R中读取a字段到表t2里查找
+3. 取出表t2中满足条件的行，跟R组成一行，作为结果集的一部分
+4. 重复执行步骤1到3，知道表t1的末尾循环结束
+
+**Simple Nested-Loop Join**
+
+被驱动表没有索引，对驱动表做全表扫描，每次到t2去匹配时，也要做全表扫描
+
+```
+select * from t1 straight_join t2 on (t1.a=t2.b);
+```
+
+**Block Nested-Loop Join**
+
+被驱动表没有索引，使用join_buffer存储驱动表数据，join_buffer大小由join_buffer_size设定，默认值是256k
+
+```
+select * from t1 straight_join t2 on (t1.a=t2.b);
+```
+
+1. 扫描表t1，顺序读取数据行放入join_buffer中，若表t1全部放入join_buffer或join_buffer满了，则执行第二步
+2. 扫描表t2，取出每一行跟join_buffer中的数据做对比，满足join条件，作为结果集的一部分返回
+3. 若t1已全部放入join_buffer则结束，否则清空join_buffer，继续执行第一步
+
+和join_buffer的数据做对比是内存操作，比Simple Nested-Loop Join效率要高
+
+选择驱动表的原则：选择小表作为驱动。两个表按照各自的条件过滤，过滤完成后，计算参与join的各个字段的总数据量，数据量小的表就是小表，应该作为驱动表
+
+#### join优化
+
+**Multi-Range Read 优化**
+
+按主键递增顺序查询，对磁盘读接近顺序读，能提升读性能
+
+MRR优化流程：
+1. 定位到满足条件的记录，将主键放入read_rnd_buffer中
+2. 将read_rnd_buffer中的主键进行递增排序
+3. 排序后的主键数组，依次到主键索引中查记录，并作为结果返回
+
+read_rnd_buffer 的大小由 read_rnd_buffer_size 参数控制。如果步骤1的read_rnd_buffer 放满了，就会先执行完步骤 2 和 3，然后清空 read_rnd_buffer，继续循环
+
+使用MRR优化，需要设置`set optimizer_switch="mrr_cost_based=off"`，explain结果如下
+
+![516f0da3b031401bb32e1d3370bde8e5](MySQL实战学习笔记.resources/DAF9C212-5C58-45A5-8F30-3969D362D701.png)
+
+MRR 能够提升性能的核心在于，查询语句在索引上做的是一个范围查询（也就是说，这是一个多值查询），可以得到足够多的主键。这样通过排序以后，再去主键索引查数据，才能体现出“顺序性”的优势
+
+**Batched Key Access**
+
+NLJ 算法执行的逻辑是：从驱动表 t1，一行行地取出 a 的值，再到被驱动表 t2 去做 join。也就是说，对于表 t2 来说，每次都是匹配一个值，MRR 的优势就用不上
+
+NLJ 算法优化后的 BKA 算法的流程为
+
+1. 从驱动表t1批量取出数据，放入join_buffer
+2. 将join_buffer里的数据批量传给被驱动表t2
+3. 循环步骤1和2，知道驱动表t1的数据处理完成
+
+开启BKA算法需要设置`set optimizer_switch='mrr=on,mrr_cost_based=off,batched_key_access=on';`
+
+**BNL 算法的性能问题**
+
+由于会对被驱动表做多次扫描，会对Buffer Poll造成影响
+
+1. 被驱动表较小，old区能放下，由于扫描多次，扫描间隔超过1秒，会进入young区，影响young区缓存命中率
+2. 被驱动表较大，old区放不下，会反复在old区淘汰，导致old区的正常业务数据没有机会进入young区
+
+优化思路
+
+1. 增大 join_buffer_size 的值，减少对被驱动表的扫描次数
+2. 给被驱动表的 join 字段加上索引，把 BNL 算法转成 BKA 算法
+
+**BNL 转 BKA**
+
+一些情况下，我们可以直接在被驱动表上建索引，这时就可以直接转成 BKA 算法，也有一些不适合的，比如
+
+```
+select * from t1 join t2 on (t1.b=t2.b) where t2.b>=1 and t2.b<=2000;
+```
+
+其中t2有100W行数据，但是经过where条件过滤只剩2000行，t1有1000行数据。使用BNL算法会对t2做多次遍历，在t2上建索引又比较浪费，此时可以使用临时表的方式
+
+1. 把表 t2 中满足条件的数据放在临时表 tmp_t 中；
+2. 为了让 join 使用 BKA 算法，给临时表 tmp_t 的字段 b 加上索引；
+3. 让表 t1 和 tmp_t 做 join 操作。
+
+**hash join**
+
+业务自己实现，将两个表的数据取到内存，建立hash表再查找
