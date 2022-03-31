@@ -1030,3 +1030,30 @@ select * from t1 join t2 on (t1.b=t2.b) where t2.b>=1 and t2.b<=2000;
 **hash join**
 
 业务自己实现，将两个表的数据取到内存，建立hash表再查找
+
+#### 临时表
+**临时表特点**
+
+1. 建表语法`create temporary table`
+2. 只能被创建它的session访问，对其它线程不可见，session结束自动删除
+3. 临时表可以与普通表重名
+4. session内有同名的临时表和普通表时，show create语句以及增删改查语句访问的是临时表
+5. show tables命令不显示临时表
+
+**临时表应用**
+
+如果一个查询需要查多个分库再汇总，可以先创建临时表，在各个分库查到结果，插入临时表，再在临时表上进行查询
+
+**临时表命名**
+
+临时表的磁盘文件命名格式为`#sql{进程 id}_{线程 id}_ 序列号.frm`
+
+内存里面也有一套机制区别不同的表，每个表都对应一个 table_def_key，普通表的table_ref_key点值是由"库名+表名"得到，而临时表在这个基础上，又加入了"server_id+thread_id"
+
+每个线程维护了自己的临时表链表，操作表的时候，先遍历链表，如果匹配到临时表，就优先操作临时表，如果没有再操作普通表，session结束的时候，对链表里的每个临时表执行"DROP TEMPORARY TABLE + 表名”操作
+
+**临时表的主备复制**
+
+在 binlog_format=row的时候，临时表的操作不记录到 binlog 中，只在 binlog_format=statment/mixed 的时候，binlog 中才会记录临时表的操作
+
+主库两个不同session创建同名临时表，记录binlog的时候，会把执行语句的线程id写到binlog中，这样备库的应用线程在创建临时表的时候就不会冲突
