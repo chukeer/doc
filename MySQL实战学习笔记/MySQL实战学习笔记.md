@@ -1057,3 +1057,67 @@ select * from t1 join t2 on (t1.b=t2.b) where t2.b>=1 and t2.b<=2000;
 在 binlog_format=row的时候，临时表的操作不记录到 binlog 中，只在 binlog_format=statment/mixed 的时候，binlog 中才会记录临时表的操作
 
 主库两个不同session创建同名临时表，记录binlog的时候，会把执行语句的线程id写到binlog中，这样备库的应用线程在创建临时表的时候就不会冲突
+
+**内部临时表**
+
+union操作
+
+```
+(select 1000 as f) union (select id from t1 order by id desc limit 2);
+```
+
+1. 创建内存临时表
+2. 执行第一个查询，将结果放入临时表
+3. 执行第二个查询，将结果放入临时表
+4. 从临时表取出结果，删除临时表
+
+group by
+
+```
+select id%10 as m, count(*) as c from t1 group by m;
+```
+
+1. 创建内存临时表，表里有两个字段 m 和 c，主键是 m；
+2. 扫描表 t1 的索引，依次取出叶子节点上的 id 值，计算 id%10 的结果，记为 x；
+    1. 如果临时表中没有主键为 x 的行，就插入一个记录 (x,1);
+    2. 如果表中有主键为 x 的行，就将 x 这一行的 c 值加 1；
+3. 遍历完成后，再根据字段 m 做排序，得到结果集返回给客户端。
+
+如果不用排序，改成
+
+```
+select id%10 as m, count(*) as c from t1 group by m order by null;
+```
+
+就会跳过最后的排序阶段
+
+内存临时表的内存大小由tmp_table_size设置，超过上限后就会把内存临时表转成磁盘临时表，磁盘临时表默认使用InnoDB引擎
+
+group by使用索引优化
+
+如果group by的列是顺序的，就不需要使用临时表。在MySQL 5.7 版本支持了 generated column 机制，用来实现列数据的关联更新，如
+
+```
+alter table t1 add column z int generated always as(id % 100), add index(z);
+```
+
+这样语句`select id%100 as m, count(*) as c from t1 group by m order by null limit 10;`就可以改成`
+select z, count(*) as c from t1 group by z;`，就可以直接使用索引了
+
+group by使用直接排序
+
+在 group by 语句中加入 SQL_BIG_RESULT 这个提示（hint），就可以告诉优化器：这个语句涉及的数据量很大，请直接用磁盘临时表，由于磁盘临时表是B+树存储，存储效率不如数组，索引优化器从磁盘空间考虑，会直接使用数组来存
+
+因此以下语句
+
+```
+select SQL_BIG_RESULT id%100 as m, count(*) as c from t1 group by m;
+```
+
+执行流程为
+
+1. 初始化 sort_buffer，确定放入一个整型字段，记为 m；
+2. 扫描表 t1 的索引 a，依次取出里面的 id 值, 将 id%100 的值存入 sort_buffer 中；
+3. 扫描完成后，对 sort_buffer 的字段 m 做排序（如果 sort_buffer 内存不够用，就会利用磁盘临时文件辅助排序）；
+4. 排序完成后，就得到了一个有序数组
+5. 根据有序数组，遍历一遍就可以得到每个值出现的次数
