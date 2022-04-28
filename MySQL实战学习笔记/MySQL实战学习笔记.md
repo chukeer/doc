@@ -1181,3 +1181,18 @@ MySQL 5.1.22 版本引入了一个新策略，新增参数 innodb_autoinc_lock_m
 * 依此类推，同一个语句去申请自增 id，每次申请到的自增 id 个数都是上一次的两倍
 
 如果一次申请分配的id没有用完，就会被浪费掉，也会导致自增id不连续
+
+#### insert
+
+* insert ... select在可重复读隔离级别下，会给select的表里扫描到的记录和间隙加读锁
+* insert和select的对象是同一个表，为了避免表扫描边插入导致循环写入，会先扫描全表（哪怕select语句使用了limit 1），创建临时表，再将结果写入表
+* insert出现唯一键冲突时，会在冲突的唯一值上加共享的next-key lock(S锁）
+* insert into … on duplicate key update 这个语义的逻辑是，插入一行数据，如果碰到唯一键约束，就执行后面的更新语句，如果有多个列违反了唯一性约束，就会按照索引对顺序，修改第一个索引冲突的行
+
+以下情况会死锁
+
+![5355e14d8b9748577b079d1e7d0e13cc.png](evernotecid://EEC0C11C-72D0-424A-B3F0-C5E7487A7BDC/appyinxiangcom/937263/ENNote/p760?hash=5355e14d8b9748577b079d1e7d0e13cc)
+
+* T1时刻，session A执行insert，在索引c的c=5上加了记录锁（唯一索引，退化为记录锁）
+* T2时刻，session B执行insert发现唯一键冲突，在索引c上c=5加上读锁，同理session B也加上读锁
+* T3时刻，session A回滚，这时候session B和C都试图继续执行插入操作，需要加写锁，两个session都要等待对方的读锁，因此出现死锁
