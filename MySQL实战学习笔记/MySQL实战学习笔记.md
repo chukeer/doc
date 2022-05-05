@@ -1191,8 +1191,184 @@ MySQL 5.1.22 版本引入了一个新策略，新增参数 innodb_autoinc_lock_m
 
 以下情况会死锁
 
-![5355e14d8b9748577b079d1e7d0e13cc.png](evernotecid://EEC0C11C-72D0-424A-B3F0-C5E7487A7BDC/appyinxiangcom/937263/ENNote/p760?hash=5355e14d8b9748577b079d1e7d0e13cc)
+![5355e14d8b9748577b079d1e7d0e13cc](MySQL实战学习笔记.resources/8AF808AF-590E-4E0C-8A04-1C1A1B3AEF22.png)
 
 * T1时刻，session A执行insert，在索引c的c=5上加了记录锁（唯一索引，退化为记录锁）
 * T2时刻，session B执行insert发现唯一键冲突，在索引c上c=5加上读锁，同理session B也加上读锁
 * T3时刻，session A回滚，这时候session B和C都试图继续执行插入操作，需要加写锁，两个session都要等待对方的读锁，因此出现死锁
+
+#### 复制表
+假设，我们要把 db1.t 里面 a>900 的数据行导出来，插入到 db2.t 中
+
+**mysqldump方法**
+
+导出数据
+
+```
+mysqldump -h$host -P$port -u$user --add-locks=0 --no-create-info --single-transaction  --set-gtid-purged=OFF db1 t --where="a>900" --result-file=/client_tmp/t.sql
+```
+
+* `–single-transaction`: 在导出数据的时候不需要对表 db1.t 加表锁，而是使用 START TRANSACTION WITH CONSISTENT SNAPSHOT 的方法
+* `–add-locks=0`: 在输出的文件结果里，不增加" LOCK TABLES t WRITE;"
+* `–no-create-info`: 不需要导出表结构
+* `–set-gtid-purged=off`: 不输出跟 GTID 相关的信息
+* `–result-file`: 指定输出文件的路径，其中 client 表示生成的文件是在客户端机器上的。
+
+这样生成的是一条insert语句，包含多个value对，如果想每个insert语句只包含一个value，需要加上参数`–skip-extended-insert`
+
+导入数据
+
+```
+mysql -h$host -P$port -u$user db2 -e "source /client_tmp/t.sql"
+```
+
+source 并不是一条 SQL 语句，而是一个客户端命令。mysql 客户端执行这个命令的流程如下
+
+1. 打开文件，默认以分号为结尾读取一条条的 SQL 语句
+2. 将 SQL 语句发送到服务端执行。
+
+**导出 CSV 文件**
+
+导出数据
+
+```
+select * from db1.t where a>900 into outfile '/server_tmp/t.csv';
+```
+
+注意点如下：
+
+* 导出结果保存在服务端。如果你执行命令的客户端和 MySQL 服务端不在同一个机器上，客户端机器的临时目录下是不会生成 t.csv 文件的
+* into outfile 指定了文件的生成位置（/server_tmp/），这个位置必须受参数 secure_file_priv 的限制。参数 secure_file_priv 的可选值和作用分别是
+    * 如果设置为 empty，表示不限制文件生成的位置，这是不安全的设置
+    * 如果设置为一个表示路径的字符串，就要求生成的文件只能放在这个指定的目录，或者它的子目录
+    * 如果设置为 NULL，就表示禁止在这个 MySQL 实例上执行 select … into outfile 操作
+* 这条命令不会帮你覆盖文件，因此你需要确保 /server_tmp/t.csv 这个文件不存在，否则执行语句时就会因为有同名文件的存在而报错
+* 这条命令生成的文本文件中，原则上一个数据行对应文本文件的一行。但是，如果字段中包含换行符，在生成的文本中也会有换行符。不过类似换行符、制表符这类符号，前面都会跟上“\”这个转义符，这样就可以跟字段之间、数据行之间的分隔符区分开
+
+导入数据
+
+```
+load data infile '/server_tmp/t.csv' into table db2.t;
+```
+
+执行流程如下：
+
+1. 打开文件 /server_tmp/t.csv，以制表符 (\t) 作为字段间的分隔符，以换行符（\n）作为记录之间的分隔符，进行数据读取
+2. 启动事务
+3. 判断每一行的字段数与表 db2.t 是否相同
+    * 若不相同，则直接报错，事务回滚
+    * 若相同，则构造成一行，调用 InnoDB 引擎接口，写入到表中
+4. 重复步骤 3，直到 /server_tmp/t.csv 整个文件读入完成，提交事务
+
+如果 binlog_format=statement，这条语句的同步流程为
+
+1. 主库执行完成后，将 /server_tmp/t.csv 文件的内容直接写到 binlog 文件中
+2. 往 binlog 文件中写入语句 load data local infile ‘/tmp/SQL_LOAD_MB-1-0’ INTO TABLE `db2`.`t
+3. 把这个 binlog 日志传到备库
+4. 备库的 apply 线程在执行这个事务日志时
+    1. 先将 binlog 中 t.csv 文件的内容读出来，写入到本地临时目录 /tmp/SQL_LOAD_MB-1-0 中
+    2. 再执行 load data 语句，往备库的 db2.t 表中插入跟主库相同的数据
+    
+备库执行的 load data 语句里面，多了一个“local”
+
+1. 不加“local”，是读取服务端的文件，这个文件必须在 secure_file_priv 指定的目录或子目录下
+2. 加上“local”，读取的是客户端的文件，只要 mysql 客户端有访问这个文件的权限即可。这时候，MySQL 客户端会先把本地文件传给服务端，然后执行上述的load data流程
+
+binlog传到备库也是在服务端执行，添加local标识还有以下考虑
+
+1. 防止备库配置了`secure_file_priv=null`，不加local可能导入失败
+2. 使用`mysqlbinlog $binlog_file | mysql -h$host -P$port -u$user -p$pwd`语句导入，binlog增加local就可以支持非本地的`$host`
+
+select …into outfile 方法不会生成表结构文件，mysqldump 提供了一个–tab 参数，可以同时导出表结构定义文件和 csv 数据文件
+
+```
+mysqldump -h$host -P$port -u$user ---single-transaction  --set-gtid-purged=OFF db1 t --where="a>900" --tab=$secure_file_priv
+```
+
+**物理拷贝方法**
+
+在 MySQL 5.6 版本引入了可传输表空间(transportable tablespace) 的方法，可以通过导出 + 导入表空间的方式，实现物理拷贝表的功能
+
+假设我们现在的目标是在 db1 库下，复制一个跟表 t 相同的表 r，具体的执行步骤如下:
+
+1. 执行 create table r like t，创建一个相同表结构的空表
+2. 执行 alter table r discard tablespace，这时候 r.ibd 文件会被删除
+3. 执行 flush table t for export，这时候 db1 目录下会生成一个 t.cfg 文件
+4. 在 db1 目录下执行`cp t.cfg r.cfg; cp t.ibd r.ibd`这两个命令（这里需要注意的是，拷贝得到的两个文件，MySQL 进程要有读写权限）
+5. 执行 unlock tables，这时候 t.cfg 文件会被删除
+6. 执行 alter table r import tablespace，将这个 r.ibd 文件作为表 r 的新的表空间，由于这个文件的数据内容和 t.ibd 是相同的，所以表 r 中就有了和表 t 相同的数据
+
+关于拷贝表的这个流程，有以下几个注意点：
+1. 在第 3 步执行完 flsuh table 命令之后，db1.t 整个表处于只读状态，直到执行 unlock tables 命令后才释放读锁；
+2. 在执行 import tablespace 的时候，为了让文件里的表空间 id 和数据字典中的一致，会修改 r.ibd 的表空间 id。而这个表空间 id 存在于每一个数据页中。因此，如果是一个很大的文件（比如 TB 级别），每个数据页都需要修改，所以你会看到这个 import 语句的执行是需要一些时间的。当然，如果是相比于逻辑导入的方法，import 语句的耗时是非常短的。
+
+#### 权限
+**全局权限**
+
+```
+grant all privileges on *.* to 'ua'@'%' with grant option;
+```
+
+1. 磁盘上，将 mysql.user 表里，用户’ua’@’%'这一行的所有表示权限的字段的值都修改为‘Y’
+2. 内存里，从数组 acl_users 中找到这个用户对应的对象，将 access 值（权限位）修改为二进制的“全 1”
+
+如果有新的客户端使用用户名 ua 登录成功，MySQL 会为新连接维护一个线程对象，然后从 acl_users 数组里查到这个用户的权限，并将权限值拷贝到这个线程对象中。之后在这个连接中执行的语句，所有关于全局权限的判断，都直接使用线程对象内部保存的权限位
+
+grant命令对于全局权限，只对新连接生效，已经存在的连接不受影响
+
+回收语句如下
+
+```
+revoke all privileges on *.* from 'ua'@'%';
+```
+
+1. 磁盘上，将 mysql.user 表里，用户’ua’@’%'这一行的所有表示权限的字段的值都修改为“N”；
+2. 内存里，从数组 acl_users 中找到这个用户对应的对象，将 access 的值修改为 0
+
+**db权限**
+
+```
+grant all privileges on db1.* to 'ua'@'%' with grant option;
+```
+
+1. 磁盘上，往 mysql.db 表中插入了一行记录，所有权限位字段设置为“Y”；
+2. 内存里，增加一个对象到数组 acl_dbs 中，这个对象的权限位为“全 1”。
+
+每次需要判断一个用户对一个数据库读写权限的时候，都需要遍历一次 acl_dbs 数组，根据 user、host 和 db 找到匹配的对象，然后根据对象的权限位来判断
+
+当前会话如果处于某个db里面，之前use这个库的时候拿到的库权限会保存到回话变量值中，此时修改db权限不会受影响，如果显式使用db则会受影响
+
+![4eaac1ab5bf2a8596933279b9444f9f7.png](evernotecid://EEC0C11C-72D0-424A-B3F0-C5E7487A7BDC/appyinxiangcom/937263/ENNote/p760?hash=4eaac1ab5bf2a8596933279b9444f9f7)
+
+**表权限和列权限**
+
+```
+create table db1.t1(id int, a int);
+
+grant all privileges on db1.t1 to 'ua'@'%' with grant option;
+GRANT SELECT(id), INSERT (id,a) ON mydb.mytbl TO 'ua'@'%' with grant option;
+```
+
+表权限定义存放在表 mysql.tables_priv 中，列权限定义存放在表 mysql.columns_priv 中。这两类权限，组合起来存放在内存的 hash 结构 column_priv_hash 中
+
+跟db权限类似，这两个权限每次 grant 的时候都会修改数据表，也会同步修改内存中的 hash 结构。因此，对这两类权限的操作，也会马上影响到已经存在的连接
+
+**flush privileges 使用场景**
+
+flush privileges 命令会清空 acl_users 数组，然后从 mysql.user 表中读取数据重新加载，重新构造一个 acl_users 数组，对于 db 权限、表权限和列权限，也做了这样的处理
+
+正常情况下，grant 命令之后，没有必要跟着执行 flush privileges 命令，只有当磁盘中的权限数据和内存中的权限数据不一致时才需要使用
+
+这种不一致往往是由不规范的操作导致的，比如直接用 DML 语句操作系统权限表
+
+![7a576f1535884515b0442c5d69cec6f0.png](evernotecid://EEC0C11C-72D0-424A-B3F0-C5E7487A7BDC/appyinxiangcom/937263/ENNote/p760?hash=7a576f1535884515b0442c5d69cec6f0)
+
+
+直接操作系统表是不规范的操作，这个不一致状态也会导致一些更“诡异”的现象发生。比如，前面这个通过 delete 语句删除用户的例子，就会出现下面的情况
+
+![6e83f3280ca6e39ae430aeea37bdec86.png](evernotecid://EEC0C11C-72D0-424A-B3F0-C5E7487A7BDC/appyinxiangcom/937263/ENNote/p760?hash=6e83f3280ca6e39ae430aeea37bdec86)
+
+由于在 T3 时刻直接删除了数据表的记录，而内存的数据还存在。这就导致了：
+
+1. T4 时刻给用户 ua 赋权限失败，因为 mysql.user 表中找不到这行记录
+2. T5 时刻要重新创建这个用户也不行，因为在做内存判断的时候，会认为这个用户还存在。
