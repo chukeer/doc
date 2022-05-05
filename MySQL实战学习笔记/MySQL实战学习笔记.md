@@ -1338,7 +1338,7 @@ grant all privileges on db1.* to 'ua'@'%' with grant option;
 
 当前会话如果处于某个db里面，之前use这个库的时候拿到的库权限会保存到回话变量值中，此时修改db权限不会受影响，如果显式使用db则会受影响
 
-![4eaac1ab5bf2a8596933279b9444f9f7.png](evernotecid://EEC0C11C-72D0-424A-B3F0-C5E7487A7BDC/appyinxiangcom/937263/ENNote/p760?hash=4eaac1ab5bf2a8596933279b9444f9f7)
+![4eaac1ab5bf2a8596933279b9444f9f7](MySQL实战学习笔记.resources/0C1B50E6-E976-41F6-9D4E-0997B2479B30.png)
 
 **表权限和列权限**
 
@@ -1361,14 +1361,15 @@ flush privileges 命令会清空 acl_users 数组，然后从 mysql.user 表中�
 
 这种不一致往往是由不规范的操作导致的，比如直接用 DML 语句操作系统权限表
 
-![7a576f1535884515b0442c5d69cec6f0.png](evernotecid://EEC0C11C-72D0-424A-B3F0-C5E7487A7BDC/appyinxiangcom/937263/ENNote/p760?hash=7a576f1535884515b0442c5d69cec6f0)
+![7a576f1535884515b0442c5d69cec6f0](MySQL实战学习笔记.resources/AB024E54-81F5-4859-B13A-1F07CBDDA1E3.png)
 
 
 直接操作系统表是不规范的操作，这个不一致状态也会导致一些更“诡异”的现象发生。比如，前面这个通过 delete 语句删除用户的例子，就会出现下面的情况
 
-![6e83f3280ca6e39ae430aeea37bdec86.png](evernotecid://EEC0C11C-72D0-424A-B3F0-C5E7487A7BDC/appyinxiangcom/937263/ENNote/p760?hash=6e83f3280ca6e39ae430aeea37bdec86)
+![6e83f3280ca6e39ae430aeea37bdec86](MySQL实战学习笔记.resources/CEEF780C-AB35-4943-8943-4856662D63F4.png)
 
 由于在 T3 时刻直接删除了数据表的记录，而内存的数据还存在。这就导致了：
 
 1. T4 时刻给用户 ua 赋权限失败，因为 mysql.user 表中找不到这行记录
 2. T5 时刻要重新创建这个用户也不行，因为在做内存判断的时候，会认为这个用户还存在。
+
