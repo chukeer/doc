@@ -1373,3 +1373,32 @@ flush privileges 命令会清空 acl_users 数组，然后从 mysql.user 表中�
 1. T4 时刻给用户 ua 赋权限失败，因为 mysql.user 表中找不到这行记录
 2. T5 时刻要重新创建这个用户也不行，因为在做内存判断的时候，会认为这个用户还存在。
 
+#### 分区表
+**组织形式**
+
+```
+CREATE TABLE `t` (
+  `ftime` datetime NOT NULL,
+  `c` int(11) DEFAULT NULL,
+  KEY (`ftime`)
+) ENGINE=InnoDB DEFAULT CHARSET=latin1
+PARTITION BY RANGE (YEAR(ftime))
+(PARTITION p_2017 VALUES LESS THAN (2017) ENGINE = InnoDB,
+ PARTITION p_2018 VALUES LESS THAN (2018) ENGINE = InnoDB,
+ PARTITION p_2019 VALUES LESS THAN (2019) ENGINE = InnoDB,
+PARTITION p_others VALUES LESS THAN MAXVALUE ENGINE = InnoDB);
+insert into t values('2017-4-1',1),('2018-4-1',1);
+```
+表t的磁盘文件如下，每个分区对应一个.idb文件
+
+![c8ef2aab2dca72bc7fcc940ce1273782](MySQL实战学习笔记.resources/62928DB7-8A3A-4FCE-9F8D-4F30845BC64B.png)
+
+**分区表特点**
+
+1. MySQL 在第一次打开分区表的时候，需要访问所有的分区
+2. 在 server 层，认为这是同一张表，因此所有分区共用同一个 MDL 锁
+3. 在引擎层，认为这是不同的表，因此 MDL 锁之后的执行过程，会根据分区表规则，只访问必要的分区
+
+**应用场景**
+
+分区表的一个显而易见的优势是对业务透明，相对于用户分表来说，使用分区表的业务代码更简洁。分区表可以很方便的清理历史数据，就可以直接通过 alter table t drop partition ... 这个语法删掉分区，从而删掉过期的历史数据，操作是直接删除分区文件，效果跟 drop 普通表类似。与使用 delete 语句删除数据相比，优势是速度快、对系统影响小
