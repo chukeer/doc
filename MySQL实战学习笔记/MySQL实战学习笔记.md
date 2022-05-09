@@ -1402,3 +1402,76 @@ insert into t values('2017-4-1',1),('2018-4-1',1);
 **应用场景**
 
 分区表的一个显而易见的优势是对业务透明，相对于用户分表来说，使用分区表的业务代码更简洁。分区表可以很方便的清理历史数据，就可以直接通过 alter table t drop partition ... 这个语法删掉分区，从而删掉过期的历史数据，操作是直接删除分区文件，效果跟 drop 普通表类似。与使用 delete 语句删除数据相比，优势是速度快、对系统影响小
+
+#### join
+有如下表
+
+```
+create table a(f1 int, f2 int, index(f1))engine=innodb;
+create table b(f1 int, f2 int)engine=innodb;
+insert into a values(1,1),(2,2),(3,3),(4,4),(5,5),(6,6);
+insert into b values(3,3),(4,4),(5,5),(6,6),(7,7),(8,8);
+```
+
+语句
+```
+select * from a left join b on(a.f1=b.f1) and (a.f2=b.f2); /*Q1*/
+select * from a left join b on(a.f1=b.f1) where (a.f2=b.f2);/*Q2*/
+```
+
+执行结果为
+
+![c8dc42f2bf0750dfe2cc75f0651f1785](MySQL实战学习笔记.resources/C999FFBF-0220-4612-9BCC-939F35831DD6.png)
+
+Q1驱动表是a，被驱动表是b，执行流程为
+
+1. 把表 a 的内容读入 join_buffer 中。因为是 select * ，所以字段 f1 和 f2 都被放入 join_buffer 
+2. 顺序扫描表 b，对于每一行数据，判断 join 条件（也就是 (a.f1=b.f1) and (a.f2=b.f2)）是否满足，满足条件的记录, 作为结果集的一行返回。如果语句中有 where 子句，需要先判断 where 部分满足条件后，再返回
+3. 表 b 扫描完成后，对于没有被匹配的表 a 的行（在这个例子中就是 (1,1)、(2,2) 这两行），把剩余字段补上 NULL，再放入结果集中
+
+Q2驱动表是b，被驱动表是a，执行流程为：顺序扫描表 b，每一行用 b.f1 到表 a 中去查，匹配到记录后判断 a.f2=b.f2 是否满足，满足条件的话就作为结果集的一部分返回
+
+在 MySQL 里，NULL 跟任何值执行等值判断和不等值判断的结果，都是 NULL。这里包括， select NULL = NULL 的结果，也是返回 NULL，因此语句 Q2 里面 where a.f2=b.f2查询结果里面就不会包含 b.f2 是 NULL 的行，这样这个 left join 的语义就是“找到这两个表里面，f1、f2 对应相同的行，对于表 a 中存在，而表 b 中匹配不到的行，就放弃”，语义跟 join 是一致的，因此，优化器就把这条语句的 left join 改写成了 join，然后因为表 a 的 f1 上有索引，就把表 b 作为驱动表，这样就可以用上 NLJ 算法
+
+使用 left join 时，左边的表不一定是驱动表，如果需要 left join 的语义，就不能把被驱动表的字段放在 where 条件里面做等值判断或不等值判断，必须都写在 on 里面
+
+语句
+```
+select * from a join b on(a.f1=b.f1) and (a.f2=b.f2); /*Q3*/
+select * from a join b on(a.f1=b.f1) where (a.f2=b.f2);/*Q4*/
+```
+
+这两个语句都会被改写为
+```
+select * from a join b where (a.f1=b.f1) and (a.f2=b.f2);
+```
+
+在这种情况下，join 将判断条件是否全部放在 on 部分就没有区别了
+
+#### distinct和group by
+语句
+```
+select a from t group by a order by null;
+select distinct a from t;
+```
+由于group by没有指定count(*)这样的聚合函数，第一条语句的逻辑就变成：按照字段a做分组，相同的a的值只返回一行，这和distinct的语义是一样的，流程如下
+
+1. 创建一个临时表，临时表有一个字段 a，并且在这个字段 a 上创建一个唯一索引
+2. 遍历表 t，依次取数据插入临时表中
+    * 如果发现唯一键冲突，就跳过
+    * 否则插入成功
+3. 遍历完成后，将临时表作为结果集返回给客户端
+
+#### 备库自增主键
+语句
+```
+create table t(id int auto_increment primary key);
+insert into t values(null);
+```
+
+binlog格式如下
+![0c195c31171089b4b8ce669324462c4a](MySQL实战学习笔记.resources/F6DC62CB-0B01-46C4-9087-D8986052B993.png)
+
+在 insert 语句之前，还有一句 SET INSERT_ID=1。这条命令的意思是，这个线程里下一次需要用到自增值的时候，不论当前表的自增值是多少，固定用 1 这个值
+
+因此，即使两个 INSERT 语句在主备库的执行顺序不同，自增主键字段的值也不会不一致
