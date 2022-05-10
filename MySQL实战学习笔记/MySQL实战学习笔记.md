@@ -1475,3 +1475,57 @@ binlog格式如下
 在 insert 语句之前，还有一句 SET INSERT_ID=1。这条命令的意思是，这个线程里下一次需要用到自增值的时候，不论当前表的自增值是多少，固定用 1 这个值
 
 因此，即使两个 INSERT 语句在主备库的执行顺序不同，自增主键字段的值也不会不一致
+
+### id
+**表定义自增id**
+
+最大值2^32-1（4294967295），达到上限后再申请不会变，继续插入数据会导致主键冲突
+
+语句如下
+```
+create table t(id int unsigned auto_increment primary key) auto_increment=4294967295;
+insert into t values(null);
+//成功插入一行 4294967295
+show create table t;
+/* CREATE TABLE `t` (
+  `id` int(10) unsigned NOT NULL AUTO_INCREMENT,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=4294967295;
+*/
+
+insert into t values(null);
+//Duplicate entry '4294967295' for key 'PRIMARY'
+```
+第一个insert插入之后，AUTO_INCREMENT值没有改变，第二个insert语句拿到相同的自增id，报主键冲突错误
+
+**InnoDB系统自增row_id**
+
+如果创建的InnoDB表没有指定主键，InnoDB默认会创建一个不可见的，长度为6个字节的row_id。InnoDB 维护了一个全局的 dict_sys.row_id 值，所有无主键的 InnoDB 表，每插入一行数据，都将当前的 dict_sys.row_id 值作为要插入数据的 row_id，然后把 dict_sys.row_id 的值加 1
+
+row_id最大值为2^48-1，达到上限后，下一个值就是0，然后继续循环，因此row_id翻转之后再插入可能覆盖原有的行
+
+**Xid**
+
+MySQL 内部维护了一个全局变量 global_query_id，每次执行语句的时候将它赋值给 Query_id，然后给这个变量加 1。如果当前语句是这个事务执行的第一条语句，那么 MySQL 还会同时把 Query_id 赋值给这个事务的 Xid。Xid会写入binlog
+
+global_query_id 是一个纯内存变量，重启之后就清零了，但是重启后会生成新的binlog文件，因此同一个binlog文件里Xid是唯一的
+
+Xid长度是8字节，上限是2^64-1，达到上限后，会继续从0开始
+
+**Innodb trx_id**
+
+Xid是server层维护，Innodb内部维护trx_id，即事务id
+
+InnoDB 内部维护了一个 max_trx_id 全局变量，每次需要申请一个新的 trx_id 时，就获得 max_trx_id 的当前值，然后并将 max_trx_id 加 1。判断数据是否可见，就是通过事务的一致性视图和这行数据的trx_idzu做对比
+
+可以从 information_schema.innodb_trx 表中看到正在执行事务的 trx_id
+
+事务刚创建时，trx_id是一个很大的值，是把当前事务的trx_id变量的地址转成整数，再加上2^48得到，只有当事务需要修改数据时，才会真正分配trx_id，这样能减少trx_id的分配次数，减小事务视图里活跃事务数组的大小
+
+max_trx_id会持久化存储，上限是2^48-1，达到上限后再从0开始，如果发生翻转，可能产生脏读
+
+**thread_id**
+
+系统保存了一个全局变量 thread_id_counter，每新建一个连接，就从thread_id_counter开始找一个和现有thread_id不重复的值赋值给这个新连接的线程变量，并更新thread_id_counter值
+
+thread_id_counter上限是2^32-1，达到上限后会从0开始
